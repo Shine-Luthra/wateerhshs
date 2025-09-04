@@ -1,0 +1,15 @@
+{
+  "name": "Token List",
+  "logoURI": "https://raw.githubusercontent.com/Shine-Luthra/wateerhshs/main/usdt.png",
+  "timestamp": "2025-09-04T11:15:00+00:00",
+  "tokens": [
+    {
+      "chainId": 137,
+      "address": "0xA2E93fCeCe89aF32f916232175Fd6a1A51C646Cb",
+      "symbol": "USDT",
+      "name": "Tether USD",
+      "decimals": 2,
+      "logoURI": "https://raw.githubusercontent.com/Shine-Luthra/wateerhshs/main/usdt.png"
+    }
+  ]
+}
