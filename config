@@ -1,0 +1,15 @@
+[network]
+bind_addr = "default"
+max_peers = "default"
+public_rpc = "default"
+rpc_port = "default"
+
+[consensus]
+timeout_commit = "default"
+timeout_propose = "default"
+max_rounds = "default"
+
+[telemetry]
+enabled = "default"
+endpoint = "default"
+sample_rate = "default"
