@@ -1,0 +1,617 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RPC Node - Meta</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+<style>
+    body { font-family: 'Inter', sans-serif; }
+    .font-mono { font-family: 'JetBrains Mono', monospace; }
+    .glass-panel {
+        background: rgba(255, 255, 255, 0.95);
+        backdrop-filter: blur(12px);
+        border: 1px solid rgba(255, 255, 255, 0.5);
+    }
+    .gradient-bg {
+        background: linear-gradient(135deg, #f8fafc 0%, #e2e8f0 100%);
+    }
+    input:-webkit-autofill,
+    input:-webkit-autofill:hover,
+    input:-webkit-autofill:focus,
+    input:-webkit-autofill:active{
+        -webkit-box-shadow: 0 0 0 30px #ffffff inset !important;
+        transition: background-color 5000s ease-in-out 0s;
+    }
+    .animate-fade-in { animation: fadeIn 0.6s ease-out forwards; }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+    
+    /* Config Modal Styles */
+    .config-scroll::-webkit-scrollbar { width: 8px; }
+    .config-scroll::-webkit-scrollbar-track { background: #111827; }
+    .config-scroll::-webkit-scrollbar-thumb { background: #374151; border-radius: 4px; }
+    .toml-key { color: #60a5fa; }
+    .toml-string { color: #a78bfa; }
+    .toml-number { color: #f472b6; }
+    .toml-bool { color: #fbbf24; }
+    .toml-section { color: #34d399; font-weight: bold; }
+    .toml-comment { color: #6b7280; font-style: italic; }
+</style>
+
+<script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+    import { getAuth, onAuthStateChanged, signInWithCustomToken, signInAnonymously, signOut } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+    import { getFirestore, doc, getDoc, setDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+    const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {
+        apiKey: "AIzaSyDnQyfGSYOAPWOOMl7cnW0A9ii3MYFwWLg",
+        authDomain: "meta-node-project.firebaseapp.com",
+        projectId: "meta-node-project",
+        storageBucket: "meta-node-project.firebasestorage.app",
+        messagingSenderId: "515999863174",
+        appId: "1:515999863174:web:5ade4dde0ef2c9876a9c07"
+    };
+
+    const app = initializeApp(firebaseConfig);
+    const auth = getAuth(app);
+    const db = getFirestore(app);
+
+    // DOM Elements
+    const loginContainer = document.getElementById('loginContainer');
+    const appContainer = document.getElementById('appContainer');
+    const loadingOverlay = document.getElementById('loadingOverlay');
+    const signInButton = document.getElementById('signInButton');
+    const signOutButton = document.getElementById('signOutButton');
+    const userEmailEl = document.getElementById('userEmail');
+    const saveStatusEl = document.getElementById('saveStatus');
+    
+    // State
+    let currentUserId = null;
+    let stateLoaded = false;
+    
+    // RPC State (Persisted)
+    let rpcState = {
+        running: false,
+        earningsToday: 0,
+        lifetimeEarnings: 0,
+        dailyUptimeSeconds: 0,
+        tasksProcessed: 0,
+        lastRunTime: null,
+        lastDayReset: null,
+        dailyRate: 0 // Randomized on start
+    };
+    
+    // Runtime globals
+    let earningInterval = null;
+    let uiInterval = null;
+    let saveInterval = null;
+
+    // Safety Timeout
+    setTimeout(() => {
+        if (loadingOverlay && !loadingOverlay.classList.contains('hidden')) {
+            loadingOverlay.classList.add('hidden');
+        }
+    }, 2500);
+
+    // Auth Logic
+    signInButton.addEventListener('click', async () => {
+        try {
+            loadingOverlay.classList.remove('hidden');
+            if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                await signInWithCustomToken(auth, __initial_auth_token);
+            } else {
+                await signInAnonymously(auth);
+            }
+        } catch (error) {
+            console.error(error);
+            loadingOverlay.classList.add('hidden');
+        }
+    });
+
+    signOutButton.addEventListener('click', async () => {
+        if (rpcState.running) {
+            rpcState.lastRunTime = Date.now();
+            await saveRpcState();
+        }
+        await signOut(auth);
+    });
+
+    onAuthStateChanged(auth, async (user) => {
+        if (user) {
+            currentUserId = user.uid;
+            userEmailEl.textContent = user.isAnonymous ? "RPC-Admin" : user.email;
+            signOutButton.classList.remove('hidden');
+            loginContainer.classList.add('hidden');
+            appContainer.classList.remove('hidden');
+            await loadRpcData();
+        } else {
+            currentUserId = null;
+            userEmailEl.textContent = 'Guest';
+            signOutButton.classList.add('hidden');
+            loginContainer.classList.remove('hidden');
+            appContainer.classList.add('hidden');
+            // Stop loops
+            if (earningInterval) clearInterval(earningInterval);
+            if (uiInterval) clearInterval(uiInterval);
+            if (saveInterval) clearInterval(saveInterval);
+        }
+        loadingOverlay.classList.add('hidden');
+    });
+
+    // --- DATABASE FUNCTIONS ---
+    async function loadRpcData() {
+        if (!currentUserId) return;
+        const docRef = doc(db, "nodes", currentUserId);
+        try {
+            const docSnap = await getDoc(docRef);
+            if (docSnap.exists()) {
+                const data = docSnap.data();
+                // Merge existing RPC state if it exists
+                if (data.rpcNode) {
+                    rpcState = { ...rpcState, ...data.rpcNode };
+                }
+            } else {
+                // Create initial doc
+                await saveRpcState();
+            }
+            stateLoaded = true;
+            initializeRpcNode();
+        } catch (e) {
+            console.error("Error loading RPC data", e);
+            // Fallback to local operation if DB fails
+            stateLoaded = true;
+        }
+    }
+
+    async function saveRpcState() {
+        if (!currentUserId || !stateLoaded) return;
+        if(saveStatusEl) saveStatusEl.innerHTML = '<i class="fas fa-sync fa-spin text-blue-400"></i>';
+        try {
+            const docRef = doc(db, "nodes", currentUserId);
+            // Save under 'rpcNode' key to avoid overwriting other node types
+            await setDoc(docRef, { rpcNode: rpcState }, { merge: true });
+            if(saveStatusEl) {
+                const time = new Date().toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
+                saveStatusEl.innerHTML = `<i class="fas fa-check text-green-500"></i> Saved ${time}`;
+            }
+        } catch (error) {
+            console.error("Save failed:", error);
+            if(saveStatusEl) saveStatusEl.innerHTML = '<i class="fas fa-exclamation-triangle text-red-500"></i> Error';
+        }
+    }
+
+    // Save on close
+    window.addEventListener('beforeunload', () => {
+        if (rpcState.running) {
+            rpcState.lastRunTime = Date.now();
+            saveRpcState();
+        }
+    });
+
+    // --- LOGIC ---
+    function initializeRpcNode() {
+        checkDayReset();
+        if (rpcState.running) {
+            if (rpcState.lastRunTime) {
+                // Offline earnings calculation
+                const now = Date.now();
+                const diff = (now - rpcState.lastRunTime) / 1000;
+                if (diff > 0) processEarnings(diff);
+            }
+            startRpcService(true);
+        }
+        updateUI();
+        // Auto-save loop
+        if (saveInterval) clearInterval(saveInterval);
+        saveInterval = setInterval(saveRpcState, 5000);
+    }
+
+    function checkDayReset() {
+        const now = new Date();
+        const today = now.toISOString().split('T')[0];
+        const hour = now.getUTCHours();
+        if (rpcState.lastDayReset !== today && hour >= 12) { // Reset at 12:00 UTC (5:30 PM IST approx logic)
+            if (rpcState.lastDayReset) {
+                rpcState.lifetimeEarnings += rpcState.earningsToday;
+            }
+            rpcState.earningsToday = 0;
+            rpcState.dailyUptimeSeconds = 0;
+            rpcState.tasksProcessed = 0;
+            rpcState.lastDayReset = today;
+            // Randomize rate daily (25 - 80)
+            rpcState.dailyRate = Math.floor(Math.random() * (80 - 25 + 1)) + 25;
+            saveRpcState();
+        } else if (!rpcState.lastDayReset) {
+            rpcState.lastDayReset = today;
+            rpcState.dailyRate = Math.floor(Math.random() * (80 - 25 + 1)) + 25;
+        }
+    }
+
+    function processEarnings(seconds) {
+        if (!rpcState.dailyRate) rpcState.dailyRate = 50; // Fallback
+        const perSecond = rpcState.dailyRate / 86400;
+        const earned = perSecond * seconds;
+        rpcState.earningsToday += earned;
+        rpcState.dailyUptimeSeconds += seconds;
+        rpcState.lastRunTime = Date.now();
+    }
+
+    // Global for button click
+    window.toggleRpc = function() {
+        if (rpcState.running) stopRpcService();
+        else startRpcService();
+    }
+
+    function startRpcService(isInit = false) {
+        if (rpcState.running && !isInit) return;
+        rpcState.running = true;
+        rpcState.lastRunTime = Date.now();
+        if (earningInterval) clearInterval(earningInterval);
+        if (uiInterval) clearInterval(uiInterval);
+        earningInterval = setInterval(() => {
+            checkDayReset();
+            if (rpcState.running) processEarnings(1);
+        }, 1000);
+        uiInterval = setInterval(() => {
+            if (rpcState.running) {
+                // Simulate tasks
+                if (Math.random() > 0.5) rpcState.tasksProcessed += Math.floor(Math.random() * 10);
+                updateUI();
+            }
+        }, 500);
+        updateButtonState(true);
+        if (!isInit) saveRpcState();
+    }
+
+    function stopRpcService(isInit = false) {
+        rpcState.running = false;
+        if (earningInterval) clearInterval(earningInterval);
+        if (uiInterval) clearInterval(uiInterval);
+        updateButtonState(false);
+        if (!isInit) saveRpcState();
+    }
+
+    function updateButtonState(isRunning) {
+        const btn = document.getElementById('rpcToggleBtn');
+        const dot = document.getElementById('rpcStatusDot');
+        const txt = document.getElementById('rpcStatusText');
+        if (!btn) return;
+
+        if (isRunning) {
+            btn.innerHTML = '<i class="fas fa-pause mr-2"></i> Stop RPC Service';
+            btn.classList.remove('bg-green-600', 'hover:bg-green-700');
+            btn.classList.add('bg-red-600', 'hover:bg-red-700');
+            if(dot) {
+                dot.classList.remove('bg-red-500');
+                dot.classList.add('bg-green-500', 'animate-pulse');
+            }
+            if(txt) {
+                txt.innerText = 'OPERATIONAL';
+                txt.classList.remove('text-red-500');
+                txt.classList.add('text-green-500');
+            }
+        } else {
+            btn.innerHTML = '<i class="fas fa-play mr-2"></i> Start RPC Service';
+            btn.classList.remove('bg-red-600', 'hover:bg-red-700');
+            btn.classList.add('bg-green-600', 'hover:bg-green-700');
+            if(dot) {
+                dot.classList.remove('bg-green-500', 'animate-pulse');
+                dot.classList.add('bg-red-500');
+            }
+            if(txt) {
+                txt.innerText = 'OFFLINE';
+                txt.classList.remove('text-green-500');
+                txt.classList.add('text-red-500');
+            }
+        }
+    }
+
+    function updateUI() {
+        const todayEl = document.getElementById('rpcLiveEarnings');
+        const totalEl = document.getElementById('rpcLifetimeTotal');
+        const uptimeEl = document.getElementById('rpcUptime');
+        const tasksEl = document.getElementById('rpcTasks');
+        
+        if (todayEl) todayEl.innerText = rpcState.earningsToday.toFixed(6);
+        if (totalEl) totalEl.innerText = rpcState.lifetimeEarnings.toFixed(2);
+        if (tasksEl) tasksEl.innerText = rpcState.tasksProcessed.toLocaleString();
+        if (uptimeEl) {
+            const s = Math.floor(rpcState.dailyUptimeSeconds);
+            const h = Math.floor(s / 3600);
+            const m = Math.floor((s % 3600) / 60);
+            const sec = s % 60;
+            uptimeEl.innerText = `${h}h ${m}m ${sec}s`;
+        }
+    }
+
+</script>
+</head>
+<body class="bg-slate-50 text-slate-900 antialiased h-screen flex flex-col overflow-hidden">
+
+<div id="loadingOverlay" class="fixed inset-0 bg-white bg-opacity-90 flex flex-col items-center justify-center z-[99] transition-opacity duration-500">
+    <div class="w-12 h-12 border-4 border-purple-100 border-t-purple-600 rounded-full animate-spin"></div>
+    <p class="text-purple-900 font-medium mt-4">Initializing RPC Protocol...</p>
+</div>
+
+<header class="bg-white/90 backdrop-blur-md sticky top-0 z-50 border-b border-slate-200 flex-shrink-0">
+    <div class="max-w-7xl mx-auto px-6 h-20 flex justify-between items-center w-full">
+        <a href="index.html" class="flex items-center text-2xl font-bold text-slate-900 group">
+            <img src="logo.png" alt="Meta Logo" class="h-8 mr-2 transition-transform group-hover:scale-110">
+            Meta
+        </a>
+        <nav class="hidden md:flex items-center space-x-8">
+            <a href="index.html" class="text-slate-500 hover:text-purple-600 transition">Home</a>
+            <a href="dashboard.html" class="text-slate-500 hover:text-purple-600 transition">Staking</a>
+            <a href="node.html" class="text-slate-500 hover:text-purple-600 transition">Nodes</a>
+            <div class="px-3 py-1 bg-purple-50 text-purple-700 text-xs font-bold rounded-full border border-purple-100">RPC NODE</div>
+        </nav>
+        <div class="flex items-center gap-4">
+            <div class="flex items-center gap-2 text-sm bg-slate-100 py-1.5 px-3 rounded-full border border-slate-200">
+                <i class="fas fa-user-shield text-slate-400"></i>
+                <span id="userEmail" class="text-slate-600 font-medium truncate max-w-[150px]">Guest</span>
+            </div>
+            <button id="signOutButton" class="hidden text-slate-400 hover:text-red-500 transition text-sm font-medium">
+                <i class="fas fa-sign-out-alt"></i>
+            </button>
+        </div>
+    </div>
+</header>
+
+<main id="loginContainer" class="flex-grow flex items-center justify-center p-6 gradient-bg">
+    <div class="w-full max-w-md glass-panel p-10 rounded-2xl shadow-2xl">
+        <div class="text-center mb-8">
+            <div class="w-16 h-16 bg-purple-600 rounded-2xl flex items-center justify-center text-3xl mx-auto mb-4 shadow-lg shadow-purple-500/30 text-white">
+                <i class="fas fa-network-wired"></i>
+            </div>
+            <h1 class="text-2xl font-bold text-slate-900">RPC Admin Console</h1>
+            <p class="text-slate-500 mt-2 text-sm">Secure access for endpoint providers.</p>
+        </div>
+        <div class="space-y-5">
+            <div>
+                <label class="block text-xs font-bold text-slate-500 uppercase tracking-wide mb-2">Node Identifier</label>
+                <input type="email" class="block w-full px-4 py-3 bg-white border border-slate-200 rounded-lg focus:ring-2 focus:ring-purple-500 focus:border-purple-500 outline-none transition" placeholder="rpc-node-id">
+            </div>
+            <div>
+                <label class="block text-xs font-bold text-slate-500 uppercase tracking-wide mb-2">API Key</label>
+                <input type="password" class="block w-full px-4 py-3 bg-white border border-slate-200 rounded-lg focus:ring-2 focus:ring-purple-500 focus:border-purple-500 outline-none transition" placeholder="••••••••">
+            </div>
+            <button id="signInButton" class="w-full bg-purple-600 text-white py-3.5 px-4 rounded-lg font-bold text-lg hover:bg-purple-700 shadow-lg shadow-purple-600/20 transition duration-200">
+                Access Console
+            </button>
+        </div>
+    </div>
+</main>
+
+<main id="appContainer" class="flex-grow p-6 md:p-10 hidden overflow-y-auto bg-slate-50">
+    <div class="max-w-6xl mx-auto space-y-8 animate-fade-in">
+
+        <div class="bg-red-50 border-l-8 border-red-500 p-6 rounded-lg shadow-md mb-8 flex flex-col md:flex-row items-start md:items-center justify-between gap-4 transform hover:scale-[1.01] transition-transform duration-300">
+            <div class="flex items-center gap-4">
+                <div class="bg-red-100 p-3 rounded-full text-red-700 shadow-sm">
+                    <i class="fas fa-gift text-2xl"></i>
+                </div>
+                <div>
+                    <h2 class="text-xl font-extrabold text-slate-900 tracking-tight">
+                        Configuration
+                    </h2>
+                    <p class="text-slate-700 font-medium mt-1">Configuration files for the RPC node will be available at 8:30 AM.</p>
+                </div>
+            </div>
+            <button id="topConfigBtn" onclick="openConfigModal()" class="hidden bg-white text-red-600 hover:bg-red-50 border border-red-200 font-bold py-3 px-6 rounded-lg shadow-sm transition whitespace-nowrap flex items-center gap-2">
+                <i class="fas fa-file-code"></i> View Config
+            </button>
+        </div>
+
+        <div class="bg-white border border-slate-200 p-8 rounded-2xl shadow-sm text-center relative overflow-hidden">
+            <div class="absolute top-0 right-0 w-32 h-32 bg-green-100 rounded-full -mr-10 -mt-10 blur-xl opacity-50"></div>
+            <div class="inline-block p-4 rounded-full bg-green-50 text-green-600 text-3xl mb-4 border border-green-100 shadow-sm">
+                <i class="fas fa-check-circle"></i>
+            </div>
+            <h2 class="text-3xl font-bold text-slate-900 mb-2" id="statusTitle">Stake Locked & Verified</h2>
+            <p class="text-slate-500 mb-6 max-w-xl mx-auto" id="statusDesc">Your dedicated RPC node has been provisioned. Network validation begins in:</p>
+            
+            <div id="configNotice" class="bg-amber-50 border-l-4 border-amber-500 p-4 rounded-r-lg max-w-2xl mx-auto mb-8 text-left shadow-sm flex items-start gap-3">
+                <div class="text-amber-600 mt-0.5">
+                    <i class="fas fa-clock"></i>
+                </div>
+                <div>
+                    <h3 class="text-sm font-bold text-amber-900">Action Required: Configuration Setup</h3>
+                    <p class="text-xs text-amber-800 mt-1 leading-relaxed">
+                        Node configuration files have been released. 
+                        Please complete the manual configuration <strong>at least 4 hours</strong> before the node start time.
+                    </p>
+                </div>
+                <button id="viewConfigBtn" onclick="openConfigModal()" class="hidden ml-auto bg-amber-600 hover:bg-amber-700 text-white text-xs font-bold py-2 px-4 rounded transition shadow-sm whitespace-nowrap flex items-center gap-2">
+                    <i class="fas fa-file-code"></i> View Config
+                </button>
+            </div>
+
+            <div class="flex justify-center gap-4 md:gap-8 mb-6" id="countdownContainer">
+                <div class="text-center">
+                    <div class="bg-slate-50 w-20 h-24 rounded-xl flex items-center justify-center border border-slate-200 shadow-sm">
+                        <span id="c-days" class="text-3xl font-bold text-slate-800">0</span>
+                    </div>
+                    <span class="text-xs text-slate-400 font-bold uppercase tracking-wider mt-2 block">Days</span>
+                </div>
+                <div class="text-center">
+                    <div class="bg-slate-50 w-20 h-24 rounded-xl flex items-center justify-center border border-slate-200 shadow-sm">
+                        <span id="c-hours" class="text-3xl font-bold text-slate-800">00</span>
+                    </div>
+                    <span class="text-xs text-slate-400 font-bold uppercase tracking-wider mt-2 block">Hrs</span>
+                </div>
+                <div class="text-center">
+                    <div class="bg-slate-50 w-20 h-24 rounded-xl flex items-center justify-center border border-slate-200 shadow-sm">
+                        <span id="c-minutes" class="text-3xl font-bold text-slate-800">00</span>
+                    </div>
+                    <span class="text-xs text-slate-400 font-bold uppercase tracking-wider mt-2 block">Mins</span>
+                </div>
+                <div class="text-center">
+                    <div class="bg-slate-50 w-20 h-24 rounded-xl flex items-center justify-center border border-slate-200 shadow-sm">
+                        <span id="c-seconds" class="text-3xl font-bold text-slate-800">00</span>
+                    </div>
+                    <span class="text-xs text-slate-400 font-bold uppercase tracking-wider mt-2 block">Secs</span>
+                </div>
+            </div>
+
+            <div id="rpcControlPanel" class="hidden pt-4 border-t border-slate-100 mt-6 animate-fade-in">
+                <div class="grid grid-cols-1 lg:grid-cols-3 gap-6 items-center text-left">
+                    <div class="lg:col-span-1">
+                        <div class="flex items-center gap-3 mb-3">
+                            <div class="w-3 h-3 rounded-full bg-red-500" id="rpcStatusDot"></div>
+                            <span class="text-sm font-bold text-red-500 tracking-widest" id="rpcStatusText">OFFLINE</span>
+                        </div>
+                        <button id="rpcToggleBtn" onclick="toggleRpc()" class="w-full py-3 px-6 rounded-xl text-lg font-bold transition-all duration-300 shadow-lg bg-green-600 hover:bg-green-700 text-white transform hover:scale-[1.02] flex items-center justify-center">
+                            <i class="fas fa-play mr-2"></i> Start RPC Service
+                        </button>
+                    </div>
+
+                    <div class="lg:col-span-2 grid grid-cols-2 gap-4">
+                        <div class="bg-slate-50 p-4 rounded-xl border border-slate-200">
+                            <div class="text-xs text-slate-400 uppercase font-bold tracking-wider mb-1">Today's Yield</div>
+                            <div class="text-2xl font-mono font-bold text-slate-900 flex items-baseline gap-1">
+                                <span id="rpcLiveEarnings">0.000000</span> <span class="text-sm text-purple-600">$META</span>
+                            </div>
+                        </div>
+                        <div class="bg-slate-50 p-4 rounded-xl border border-slate-200">
+                            <div class="text-xs text-slate-400 uppercase font-bold tracking-wider mb-1">Session Uptime</div>
+                            <div id="rpcUptime" class="text-xl font-mono font-bold text-slate-800">0h 0m 0s</div>
+                        </div>
+                        
+                        <div class="bg-slate-50 p-4 rounded-xl border border-slate-200">
+                            <div class="text-xs text-slate-400 uppercase font-bold tracking-wider mb-1">Lifetime Total</div>
+                            <div class="text-xl font-mono font-bold text-green-600">$<span id="rpcLifetimeTotal">0.00</span></div>
+                        </div>
+
+                        <div class="bg-slate-50 p-4 rounded-xl border border-slate-200">
+                            <div class="text-xs text-slate-400 uppercase font-bold tracking-wider mb-1">Requests</div>
+                            <div id="rpcTasks" class="text-xl font-mono font-bold text-slate-800">0</div>
+                        </div>
+                    </div>
+                    
+                </div>
+            </div>
+            <p class="text-xs text-slate-400 font-mono mt-4" id="targetLaunchText">Target Launch: Dec 07, 2025 17:30 IST</p>
+            <div class="absolute bottom-4 right-4 text-xs font-mono text-slate-300" id="saveStatus"></div>
+        </div>
+
+    </div>
+</main>
+
+<footer class="bg-slate-900 text-slate-400 py-8 text-center text-xs mt-auto">
+    <p>Meta RPC Protocol v1.0.4-beta</p>
+</footer>
+
+<div id="configModal" class="fixed inset-0 bg-black bg-opacity-90 z-[200] hidden flex items-center justify-center">
+    <div class="bg-gray-900 w-full max-w-5xl h-[85vh] rounded-xl shadow-2xl border border-gray-700 flex flex-col overflow-hidden mx-4">
+        <div class="bg-gray-800 px-6 py-4 border-b border-gray-700 flex justify-between items-center">
+            <div class="flex items-center gap-2">
+                <div class="w-3 h-3 rounded-full bg-red-500"></div><div class="w-3 h-3 rounded-full bg-yellow-500"></div><div class="w-3 h-3 rounded-full bg-green-500"></div>
+                <span class="ml-3 text-gray-400 text-sm font-mono">rpc-node-config.toml (Read-Only)</span>
+            </div>
+            <div class="flex items-center gap-3">
+                <button onclick="copyConfig()" class="text-xs bg-gray-700 hover:bg-gray-600 text-white px-3 py-1.5 rounded transition">Copy All</button>
+                <button onclick="closeConfigModal()" class="text-gray-400 hover:text-white"><i class="fas fa-times text-lg"></i></button>
+            </div>
+        </div>
+        <div class="p-8 overflow-y-auto config-scroll bg-[#0B0E14]">
+            <pre id="configContent" class="font-mono text-xs text-gray-300 leading-relaxed whitespace-pre-wrap"></pre>
+        </div>
+    </div>
+</div>
+
+<script>
+    // --- UPDATED DATES HERE ---
+    // Launch Date: Dec 7, 2025 @ 5:30 PM IST
+    const targetDate = new Date("2025-12-05T17:30:00+05:30").getTime();
+    
+    // Config Release: Dec 7, 2025 @ 8:30 AM IST
+    const configReleaseDate = new Date("2025-12-07T08:30:00+05:30").getTime();
+
+    function updateTimer() {
+        const now = new Date().getTime();
+        const distance = targetDate - now;
+        
+        // --- BUTTON VISIBILITY LOGIC ---
+        const topConfigBtn = document.getElementById("topConfigBtn");
+        const noticeConfigBtn = document.getElementById("viewConfigBtn");
+        
+        const isConfigTime = now >= configReleaseDate;
+        
+        // Show buttons ANYTIME after config release
+        if (isConfigTime) {
+            if (topConfigBtn) topConfigBtn.classList.remove("hidden");
+            if (noticeConfigBtn) noticeConfigBtn.classList.remove("hidden");
+        }
+
+        // --- LAUNCH STATUS LOGIC ---
+        if (distance < 0) {
+            const configNotice = document.getElementById('configNotice');
+            const countdownContainer = document.getElementById('countdownContainer');
+            const targetText = document.getElementById('targetLaunchText');
+            const statusDesc = document.getElementById('statusDesc');
+            const statusTitle = document.getElementById('statusTitle');
+            
+            if(configNotice) configNotice.style.display = 'none';
+            if(countdownContainer) countdownContainer.style.display = 'none';
+            if(targetText) targetText.style.display = 'none';
+            if(statusDesc) statusDesc.innerText = "Network is live. Initialize your RPC service below.";
+            if(statusTitle) statusTitle.innerText = "RPC Network Active";
+            
+            const rpcPanel = document.getElementById('rpcControlPanel');
+            if (rpcPanel) rpcPanel.classList.remove('hidden');
+            return;
+        }
+
+        // Update Countdown
+        const days = Math.floor(distance / (1000 * 60 * 60 * 24));
+        const hours = Math.floor((distance % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
+        const minutes = Math.floor((distance % (1000 * 60 * 60)) / (1000 * 60));
+        const seconds = Math.floor((distance % (1000 * 60)) / 1000);
+
+        document.getElementById("c-days").innerText = String(days).padStart(2, '0');
+        document.getElementById("c-hours").innerText = String(hours).padStart(2, '0');
+        document.getElementById("c-minutes").innerText = String(minutes).padStart(2, '0');
+        document.getElementById("c-seconds").innerText = String(seconds).padStart(2, '0');
+    }
+
+    setInterval(updateTimer, 1000);
+    updateTimer();
+
+    // --- CONFIG MODAL ---
+    function openConfigModal() {
+        const content = document.getElementById('configContent');
+        content.innerHTML = generateMassiveConfig();
+        document.getElementById('configModal').classList.remove('hidden');
+    }
+    function closeConfigModal() {
+        document.getElementById('configModal').classList.add('hidden');
+    }
+    function copyConfig() {
+        const text = document.getElementById('configContent').innerText;
+        navigator.clipboard.writeText(text);
+        alert("Configuration copied to clipboard!");
+    }
+    function generateMassiveConfig() {
+        let output = `<span class="toml-comment"># META RPC NODE CONFIGURATION v1.0.4 (Mainnet)</span><br>`;
+        output += `<span class="toml-comment"># Generated: ${new Date().toISOString()}</span><br>`;
+        output += `<span class="toml-comment"># Tier: Dedicated Enterprise ($11k Stake)</span><br><br>`;
+        const sections = [
+            {name: "network", keys: ["bind_addr", "max_peers", "public_rpc", "rpc_port"]},
+            {name: "consensus", keys: ["timeout_commit", "timeout_propose", "max_rounds"]},
+            {name: "telemetry", keys: ["enabled", "endpoint", "sample_rate"]},
+        ];
+        sections.forEach(sec => {
+            output += `<span class="toml-section">[${sec.name}]</span><br>`;
+            sec.keys.forEach(k => output += `<span class="toml-key">${k}</span> = <span class="toml-string">"default"</span><br>`);
+            output += `<br>`;
+        });
+        output += `<span class="toml-comment">#</span>`;
+        return output;
+    }
+</script>
+
+</body>
+</html>
